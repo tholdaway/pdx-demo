@@ -1,0 +1,205 @@
+---
+title: "portland demo"
+author: "Taylor Holdaway"
+date: "4/8/2016"
+output: html_document
+---
+---
+title: "pdx demo"
+output: html_document
+---
+```{r, warning=FALSE, echo=FALSE, message=FALSE}
+library(ggplot2)
+library(reshape2)
+library(ggmap)
+library(dplyr)
+library(broom)
+library(maptools)
+library(rgeos)
+library(sp)
+library(plm)
+library(pglm)
+```
+
+First we need to import, clean, and geocode the address data. Save it as a csv for future use. 
+```{r geocode and clean data, eval=FALSE, message=FALSE, warning=FALSE}
+pdx <- read.csv("pdx dmo.csv", header = F)
+pdx$V1 <- NULL
+pdx$V2 <- NULL
+names(pdx) <- c("address","year")
+pdx$address <- tolower(as.character(pdx$address))
+
+pdx$year[is.na(pdx$year)] <- 2014
+
+coord <- ggmap::geocode(pdx$address,messaging = F, output = "latlona")
+demo.address <- merge(pdx,coord, by = 0)
+demo.address$address.x <- NULL
+demo.address$Row.names <- NULL
+demo.address <- rename(demo.address, address = address.y)
+demo.address$address <- as.character(demo.address$address)
+
+write.csv(demo.address, file = "data/pdx_dmo_ref.csv",row.names = F)
+
+portland <- ggmap::get_map(location="portland OR", source = "stamen", maptype = "toner", crop = F,zoom=12)
+
+#SAVE SAVE SAVE
+save(portland, file="data/map_portland.rda")
+
+```
+
+Using a Zillow shapefile, I can overlay neighborhoods onto a map of Portland
+```{r Neighborhood Polys, message=FALSE, warning=FALSE}
+#path and name of shapefile
+file <- "data/ZillowNeighborhoods-OR/ZillowNeighborhoods-OR.shp"
+shape <- maptools::readShapePoly(file)
+shape <- shape[shape@data$CITY != "Salem" & shape@data$CITY != "Eugene",]
+shape.df <- broom::tidy(shape, region = ("REGIONID"))
+shape.df$id <- as.numeric(shape.df$id)
+rm(file)
+#load map file
+load("data/map_portland.rda")
+#overlay neighborhood shapefile on map of portland
+mapNeighborhoods <- ggmap(portland) +
+  geom_polygon(aes(x=long,y=lat, group=group), alpha = 0.25, data=shape.df, fill='white') + 
+  geom_polygon(aes(x=long,y=lat, group=group), data=shape.df, color='deeppink4', fill=NA)
+mapNeighborhoods
+```
+
+Then, using the geocoded points for demolition permits, I can overlay demolitions on a map of Portland, with neighborhood boundaries in pink.
+```{r Demo Points Overlay, message=FALSE, warning=FALSE}
+#read the georef'd address of the demo locations
+demo.address <- read.csv("data/pdx_dmo_ref.csv")
+#plot demolition permits across portland
+mapAddress <- mapNeighborhoods + geom_point(aes(x = lon, y = lat, color = as.factor(demo.address$year), shape = as.factor(demo.address$year)), data = demo.address, alpha = 0.8, size = 2.5) + scale_color_hue("Year") + scale_size(guide = "none") + scale_shape(guide = "none")
+mapAddress
+```
+
+I can then sum the number of demolition permits in each neighborhood polygon. The polygons are then collored according to this number.
+
+```{r Demo Counts Polys, message=FALSE, warning=FALSE}
+coordinates(demo.address) <- ~lon+lat
+#overlay the count data with the shapefile
+
+data <- over(subset(demo.address, year == 2014), shape[,c("NAME","REGIONID")]) %>%
+  dplyr::mutate(year = 2014)
+data <- over(subset(demo.address, year == 2015), shape[,c("NAME","REGIONID")]) %>%
+  dplyr::mutate(year = 2015) %>%
+  rbind(data) %>% 
+  na.omit()
+
+#stack up shape.df (two copies, one for each year
+shape.df$year <- 2014
+shape.df2 <- shape.df %>%
+  dplyr::mutate(year = 2015) %>%
+  rbind(shape.df)
+  
+#merge counts with the polygone dataframe
+shape.democounts.df <- 
+#count number of points in each polygon
+  data %>% group_by(REGIONID, year) %>% dplyr::summarize(count = n()) %>%
+  dplyr::right_join(shape.df2,by = c("REGIONID"="id", "year"="year")) %>%
+  dplyr::arrange(order) %>%
+#recode missing values as zero
+  dplyr::mutate(count = replace(count,is.na(count),0))
+
+#save counts for later separately:
+counts <- data %>% group_by(REGIONID, NAME, year) %>% dplyr::summarize(count = n())
+#clean up
+rm(data)
+
+
+#get back the old points dataframe, so that we can plot the points on the same plot. must do this because the old one was turned into a spatial points class
+demo.address <- read.csv("data/pdx_dmo_ref.csv")
+
+#plot the polygons shaded by number of demolitions in that neighborhood
+mapCounts.2014 <- ggmap(portland) + 
+  geom_polygon(aes(x=long,y=lat, group=group, fill=count), data=subset(shape.democounts.df,year==2014), color='black') +
+  scale_fill_gradient(low='white', high='red')
+#with the demo points indicated, to check for correctness
+#  geom_point(aes(x = lon, y = lat, shape = as.factor(demo.address$year)), data = demo.address, alpha = 0.4, size = 2.5) + 
+#  scale_size(guide = "none") + scale_shape("Year")
+#plot
+mapCounts.2014
+
+mapCounts.2015 <- ggmap(portland) + 
+  geom_polygon(aes(x=long,y=lat, group=group, fill=count), data=subset(shape.democounts.df,year==2015), color='black') +
+  scale_fill_gradient(low='white', high='red')
+#with the demo points indicated, to check for correctness
+#  geom_point(aes(x = lon, y = lat, shape = as.factor(demo.address$year)), data = demo.address, alpha = 0.4, size = 2.5) + 
+#  scale_size(guide = "none") + scale_shape("Year")
+#plot
+mapCounts.2015
+```
+
+Also using data from Zillow, I can color the neighborhood polygons according to median(?) house price. I also show house price from 2014 and 2013.
+```{r Zillow Prices, message=FALSE, warning=FALSE}
+
+prices <- read.csv("data/ZillowPrices/portland-or-neighborhoods-Zillow-Home-Value-Index-TimeSeries.csv",stringsAsFactors = F)
+#lowercase
+names(prices) <- tolower(names(prices))
+#format prices as numbers (get rid of $ and ,)
+prices[,4:123] <- (gsub("\\$", "", as.matrix(prices[,4:123])))
+prices[,4:123] <- as.numeric(gsub(",","", as.matrix(prices[,4:123]) ))
+#reshape to long, by date
+prices <- melt(prices,variable.name="date",value.name="price")
+prices <- colsplit(as.character(prices$date),"[.]",c("month","year")) %>%
+  cbind( . , prices)
+
+#calculate yearly averages for each neighborhood
+prices <- prices %>%
+  select(year,region.name,price) %>%
+  group_by(region.name,year) %>%
+  summarize(avg_price = mean(price))
+#now, merge with the polygon dataframe (but first we make a new such polygon because the old one had the REGIONID variable as )
+shape.prices.df <- shape %>% tidy(region="NAME") %>%
+  dplyr::left_join(prices,by = c("id"="region.name")) %>%
+  arrange(order)
+
+demo.address.2015 <- subset(demo.address, year == 2015)
+demo.address.2014 <- subset(demo.address, year == 2014)
+
+
+mapPrices.2014 <- ggmap(portland) + geom_polygon(aes(x=long,y=lat, group=group, fill=avg_price), alpha = 0.8, data=subset(shape.prices.df, year==2014), color='black') + scale_fill_gradient("Average Zillow Price Index",low='blue', high='red', limits=c(min(shape.prices.df$avg_price,na.rm=T),max(shape.prices.df$avg_price,na.rm=T))) +
+  geom_point(aes(x = lon, y = lat), data = subset(demo.address, year==2014), alpha = 0.4, size = 2.5) + scale_size(guide = "none") + scale_shape("Year") + ggtitle("Demolitions and House Prices for 2014")
+mapPrices.2014
+
+mapPrices.2015 <- ggmap(portland) + geom_polygon(aes(x=long,y=lat, group=group, fill=avg_price), alpha = 0.8, data=subset(shape.prices.df, year==2015), color='black') + scale_fill_gradient("Average Zillow Price Index",low='blue', high='red', limits=c(min(shape.prices.df$avg_price,na.rm=T),max(shape.prices.df$avg_price,na.rm=T))) +
+  geom_point(aes(x = lon, y = lat), data = subset(demo.address, year==2015), alpha = 0.4, size = 2.5) + scale_size(guide = "none") + scale_shape("Year") + ggtitle("Demolitions and House Prices for 2015")
+mapPrices.2015
+```
+
+I then run a regression using OLS of the number of demolition permits in each neighborhood on the median house price, to test for correlation between the prices of houses in a neighborhood and the number of demo permits issued there. I also look for correlation between median neighborhood house price in year $t-1$ and demo permits issued in year $t$.
+```{r}
+
+counts.prices.df <- prices %>% 
+  dplyr::filter(year %in% c(2012:2015)) %>%
+  left_join(counts,by=c("region.name"="NAME", "year"="year")) %>%
+  dplyr::mutate(count = replace(count,is.na(count) & year %in% c(2014,2015),0)) %>%
+  dplyr::select(-REGIONID)
+
+counts.prices.pdf <- pdata.frame(counts.prices.df, index = c("region.name", "year"), drop.index = F, row.names = T)
+
+reg <- lm(count~avg_price+lag(avg_price,k=1),data = counts.prices.pdf)
+reg1 <- plm(count~avg_price+lag(avg_price,k=1:2), data = counts.prices.pdf, model = "within", effect = "twoway")
+summary(reg)
+summary(reg1)
+poisson <- pglm
+```
+
+I fit a regression tree to examine the possibility of nonlinear relationships in the data.
+```{r}
+
+```
+
+I also examine the possibility of other important clustering in the data (how do I do this!?!?)
+
+See how many clusters are there (scree plot) across years. More clusters means more dispersed geographically.
+```{r}
+
+```
+
+
+
+http://www.r-bloggers.com/plotting-choropleths-from-shapefiles-in-r-with-ggmap-toronto-neighbourhoods-by-population/
+
+http://www.r-bloggers.com/shapefile-polygons-plotted-on-google-maps-using-ggmap-in-r-throw-some-throw-some-stats-on-that-mappart-2/
